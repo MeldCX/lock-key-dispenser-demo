@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://storage.googleapis.com/assets.meld.cx/agent/1.0.42/Agent.js"></script>
+    <style>
+        body {
+            text-align: center;
+            font-family: sans-serif;
+        }
+
+        h1, h2 {
+            margin-top: 100px;
+        }
+
+        button {
+            margin-top: 60px;
+            width: 160px;
+            height: 100px;
+        }
+
+        pre {
+            text-align: left;
+            font-size: 10px;
+            display: table;
+            margin-top: 40px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+
+    </style>
+    <title>Lock Key Demo with Card Dispenser</title>
+</head>
+
+<body>
+    <h1>Lock Key Demo with Card Dispenser</h1>
+    <h2><a id="api" href="">Lock API</a></h2>
+    <button id="create">CREATE KEY</button>
+    <button id="discard">DISCARD KEY</button>
+    <pre id="result">Initialising...</pre>
+
+    <script>
+
+        const roomNumber = '101';
+
+        const apiUrl = document.getElementById('api');
+        const createButton = document.getElementById('create');
+        const discardButton = document.getElementById('discard');
+        const resultData = document.getElementById('result');
+
+        const agent = window.Agent;
+
+
+
+        const checkDispenserStatus = async () => {
+            const response = await agent.Peripherals.Dispenser.checkMachinePresentBasicStatus();
+            return response.st0.code;
+        };
+
+        const checkBinStatus = async () => {
+            const response = await agent.Peripherals.Dispenser.checkMachinePresentBasicStatus();
+            return response.st1.code;
+        };
+
+        const sleep = timeout => new Promise(resolve => setTimeout(resolve, timeout));
+
+        const convertToString = data => data.map(i => i.toString(16).padStart(2, '0')).join('');
+
+        const create = async() => {
+            try {
+
+                //////////////////////////////////////////////////////////////
+                // Check the card dispenser status
+                //////////////////////////////////////////////////////////////
+
+                if (await checkBinStatus() === '0') {
+                    throw new Error('Card bin is empty. Please load cards into the bin');
+                }
+
+                if (await checkDispenserStatus() !== '0') {
+                    throw new Error('Card dispenser is currently in use');
+                }
+
+
+                //////////////////////////////////////////////////////////////
+                // Read a serial number from the card
+                //////////////////////////////////////////////////////////////
+
+                let cardSerialNumber = null;
+
+                const serialNumberByteSize = 4;
+                const MAD_KEY = [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5];
+
+                resultData.innerHTML = 'Reading the card data...';
+
+                await agent.Peripherals.Dispenser.moveCardFromBin();
+                const activatedForRead = await agent.Peripherals.Dispenser.activateRFID();
+
+                if (activatedForRead.cardType.code === '1K') {
+                    const authResponse = await agent.Peripherals.Dispenser.authenticate({
+                        keyNumber: 0,
+                        sectorNumber: 0,
+                        keyData: MAD_KEY
+                    });
+
+                    if (authResponse.RFIDCommandResult.code === '6f00') {
+                        await agent.Peripherals.Dispenser.deactivateRFID();
+
+                        const collectStatus = await agent.Peripherals.Dispenser.collectCardIntoCollectBin();
+                        if (collectStatus) {
+                            throw new Error('Authentication on reading failed, the card is returned to the bin');
+                        } else {
+                            throw new Error('Authentication on reading failed, the card cannot be returned to the bin');
+                        }
+                    }
+
+                    const readResponse = await agent.Peripherals.Dispenser.readSectorBlock({
+                        sectorNumber: 0,
+                        startBlock: 0,
+                        numberOfBlocks: 1
+                    });
+
+                    await agent.Peripherals.Dispenser.deactivateRFID();
+
+                    if (!readResponse.Payload || readResponse.RFIDCommandResult.code !== '9000') {
+                        const collectStatus = await agent.Peripherals.Dispenser.collectCardIntoCollectBin();
+                        if (collectStatus) {
+                            throw new Error('Cannot read the card data, the card is returned to the bin');
+                        } else {
+                            throw new Error('Cannot read the card data, the card cannot be returned to the bin');
+                        }
+                    }
+
+                    const cardMetadata = convertToString(readResponse.Payload);
+
+                    cardSerialNumber = cardMetadata.slice(0, serialNumberByteSize * 2);
+
+                    resultData.innerHTML = `Processing the card with SN ${cardSerialNumber}`;
+                } else {
+                    await agent.Peripherals.Dispenser.deactivateRFID();
+
+                    const collectStatus = await agent.Peripherals.Dispenser.collectCardIntoCollectBin();
+                    if (collectStatus) {
+                        throw new Error('Unsupported card format, the card is returned to the bin');
+                    } else {
+                        throw new Error('Unsupported card format, the card cannot be returned to the bin');
+                    }
+                }
+
+                //////////////////////////////////////////////////////////////
+                // Create a new key using Lock API
+                //////////////////////////////////////////////////////////////
+
+                // autoJoin:         If set to true or ommitted, this card will join with any overlapping cards.
+                //                   If set to false, the server will return an error if there exists any overlapping cards
+                // sendOnline:       If set to false or ommitted, the server will not send this modification to any locks. Instead, it will only
+                //                   reach a physical card through an encoder performing auto-update. If set to true, the
+                //                   modification will be sent to any guest room doors related to the modification
+                const createdKey = await agent.Lock.createKey({
+                    roomNumber,
+                    cardSerialNumber,
+                    daysBeforeExpire: 28,
+                    //autoJoin: true,
+                    //sendOnline: false,
+                    formatted: true
+                });
+
+                if (!createdKey || !createdKey.auth || !createdKey.data) {
+                    throw new Error(`Cannot create a new key using Lock API: ${JSON.stringify(createdKey || '')}`);
+                }
+
+                resultData.innerHTML = `A new card with SN ${cardSerialNumber} has been prepared for encoding using Lock API`;
+
+
+                //////////////////////////////////////////////////////////////
+                // Write the key data to the card
+                //////////////////////////////////////////////////////////////
+
+                const dataSector = 6;
+
+                const activatedForWrite = await agent.Peripherals.Dispenser.activateRFID();
+
+                if (activatedForWrite.cardType.code === '1K') {
+                    const authResponse = await agent.Peripherals.Dispenser.authenticate({
+                        keyNumber: 1,
+                        sectorNumber: dataSector,
+                        keyData: createdKey.auth
+                    });
+
+                    if (authResponse.RFIDCommandResult.code === '6f00') {
+                        await agent.Peripherals.Dispenser.deactivateRFID();
+
+                        const collectStatus = await agent.Peripherals.Dispenser.collectCardIntoCollectBin();
+                        if (collectStatus) {
+                            throw new Error('Authentication on writing failed, the card is returned to the bin');
+                        } else {
+                            throw new Error('Authentication on writing failed, the card cannot be returned to the bin');
+                        }
+                    }
+
+                    const writeResponse = await agent.Peripherals.Dispenser.writeSectorBlock({
+                        sectorNumber: dataSector,
+                        startBlock: createdKey.data[0].index,
+                        numberOfBlocks: createdKey.data.length,
+                        payload: createdKey.data.reduce((r, d) => r.concat(d.data), [])
+                    });
+
+                    await agent.Peripherals.Dispenser.deactivateRFID();
+
+                    if (writeResponse.RFIDCommandResult.code !== '9000') {
+                        const collectStatus = await agent.Peripherals.Dispenser.collectCardIntoCollectBin();
+                        if (collectStatus) {
+                            throw new Error('Cannot write the card data, the card is returned to the bin');
+                        } else {
+                            throw new Error('Cannot write the card data, the card cannot be returned to the bin');
+                        }
+                    }
+
+                    const dropStatus = await agent.Peripherals.Dispenser.moveCardToPortDrop();
+                    if (dropStatus) {
+                        await agent.Peripherals.Dispenser.forbidCardInFromPort();
+                    }
+
+                    resultData.innerHTML = `The key has been successfully created: room ${roomNumber}, card S/N ${cardSerialNumber}`;
+
+                } else {
+                    await agent.Peripherals.Dispenser.deactivateRFID();
+
+                    const collectStatus = await agent.Peripherals.Dispenser.collectCardIntoCollectBin();
+                    if (collectStatus) {
+                        throw new Error('Unsupported card format, the card is returned to the bin');
+                    } else {
+                        throw new Error('Unsupported card format, the card cannot be returned to the bin');
+                    }
+                }
+
+            } catch (ex) {
+                resultData.innerHTML = ex.toString();
+            }
+        };
+
+        const discard = async() => {
+            try {
+
+                //////////////////////////////////////////////////////////////
+                // Read a serial number from the card
+                //////////////////////////////////////////////////////////////
+
+                const serialNumberByteSize = 4;
+                const MAD_KEY = [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5];
+
+                resultData.innerHTML = 'Please insert a card for collection ...';
+
+                await agent.Peripherals.Dispenser.allowCardInFromPort();
+
+                let keepWaiting = true;
+
+                setTimeout(() => {
+                    keepWaiting = false;
+                }, 8000);
+
+                while (await checkDispenserStatus() !== '2' && keepWaiting) {
+                    await sleep(500);
+                }
+
+                if (!keepWaiting) {
+                    await agent.Peripherals.Dispenser.forbidCardInFromPort();
+                }
+
+                const activatedForRead = await agent.Peripherals.Dispenser.activateRFID();
+
+                if (activatedForRead.cardType.code === '1K') {
+                    const authResponse = await agent.Peripherals.Dispenser.authenticate({
+                        keyNumber: 0,
+                        sectorNumber: 0,
+                        keyData: MAD_KEY
+                    });
+
+                    if (authResponse.RFIDCommandResult.code === '6f00') {
+                        await agent.Peripherals.Dispenser.deactivateRFID();
+
+                        const dropStatus = await agent.Peripherals.Dispenser.moveCardToPortDrop();
+                        await agent.Peripherals.Dispenser.forbidCardInFromPort();
+                        if (dropStatus) {
+                            throw new Error('Authentication on reading failed, the card is returned');
+                        } else {
+                            throw new Error('Authentication on reading failed, the card cannot be returned');
+                        }
+                    }
+
+                    const readResponse = await agent.Peripherals.Dispenser.readSectorBlock({
+                        sectorNumber: 0,
+                        startBlock: 0,
+                        numberOfBlocks: 1
+                    });
+
+                    await agent.Peripherals.Dispenser.deactivateRFID();
+
+                    if (!readResponse.Payload || readResponse.RFIDCommandResult.code !== '9000') {
+                        const dropStatus = await agent.Peripherals.Dispenser.moveCardToPortDrop();
+                        await agent.Peripherals.Dispenser.forbidCardInFromPort();
+                        if (dropStatus) {
+                            throw new Error('Cannot read the card data, the card is returned');
+                        } else {
+                            throw new Error('Cannot read the card data, the card cannot be returned');
+                        }
+                    }
+
+                    await agent.Peripherals.Dispenser.collectCardIntoCollectBin();
+                    await agent.Peripherals.Dispenser.forbidCardInFromPort();
+
+                    const cardMetadata = convertToString(readResponse.Payload);
+
+                    cardSerialNumber = cardMetadata.slice(0, serialNumberByteSize * 2);
+
+                    resultData.innerHTML = `Processing the card with SN ${cardSerialNumber}`;
+                } else {
+                    await agent.Peripherals.Dispenser.deactivateRFID();
+
+                    const dropStatus = await agent.Peripherals.Dispenser.moveCardToPortDrop();
+                    await agent.Peripherals.Dispenser.forbidCardInFromPort();
+                    if (dropStatus) {
+                        throw new Error('Unsupported card format, the card is returned');
+                    } else {
+                        throw new Error('Unsupported card format, the card cannot be returned');
+                    }
+                }
+
+                //////////////////////////////////////////////////////////////
+                // Remove the key using Lock API
+                //////////////////////////////////////////////////////////////
+
+                // The card can be either cancelled or discarded
+                const processingResult = await agent.Lock.removeKey({
+                    cardSerialNumber,
+                    //cancel: false,
+                    discard: true
+                });
+
+                resultData.innerHTML = processingResult && processingResult.removedKeys && processingResult.removedKeys.length
+                    ? `All the keys for the card with S/N ${cardSerialNumber} have been successfully discarded: ${processingResult.removedKeys.map(k => k.id).join(', ')}`
+                    : `No valid keys found fot the card with S/N ${cardSerialNumber}`;
+
+            } catch (ex) {
+                resultData.innerHTML = ex.toString();
+            }
+        };
+
+        const initialise = async() => {
+            try {
+                await agent.onReadyAsync();
+
+                const status = await agent.Lock.getStatus();
+                if (!status.initialised) {
+                    let message = 'Waiting for initialisation to complete';
+                    message += '\n\nPlease set the following device options:';
+                    message += '\n  - mcx.api.lock.url';
+                    message += '\n  - mcx.api.lock.username';
+                    message += '\n  - mcx.api.lock.password';
+
+                    resultData.innerHTML = message;
+
+                    setTimeout(initialise, 30000);
+
+                    return;
+                }
+
+                apiUrl.href = status.server;
+
+                createButton.onclick = async() => {
+                    try {
+                        resultData.innerHTML = '';
+                        createButton.innerText = 'CREATING KEY...';
+                        createButton.disabled = true;
+                        discardButton.disabled = true;
+
+                        await create();
+                    } finally {
+                        createButton.innerText = 'CREATE KEY';
+                        createButton.disabled = false;
+                        discardButton.disabled = false;
+                    }
+                };
+
+                discardButton.onclick = async() => {
+                    try {
+                        resultData.innerHTML = '';
+                        discardButton.innerText = 'DISCARDING KEY...';
+                        createButton.disabled = true;
+                        discardButton.disabled = true;
+
+                        await discard();
+                    } finally {
+                        discardButton.innerText = 'DISCARD KEY';
+                        createButton.disabled = false;
+                        discardButton.disabled = false;
+                    }
+                }
+
+                resultData.innerHTML = 'Initialisation completed, please click "CREATE KEY" or "DISCARD KEY" buttons to continue...'
+
+            } catch (ex) {
+                resultData.innerHTML = ex.toString();
+            }
+        };
+
+        initialise();
+
+    </script>
+</body>
+
+</html>
