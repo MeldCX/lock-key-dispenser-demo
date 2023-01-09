@@ -248,13 +248,36 @@
                             }
                         }
 
-                        const changePasswordResponse = await agent.Peripherals.Dispenser.changeSectorPassword({
-                            keyNumber: 1,
+                        const readTrailerResponse = await cardDispenser.readSectorBlock({
                             sectorNumber: dataSector,
-                            keyData: createdKey.auth
+                            startBlock: 3,
+                            numberOfBlocks: 1
                         });
 
-                        if (changePasswordResponse.RFIDCommandResult.code !== '9000') {
+                        if (!readTrailerResponse.Payload || readTrailerResponse.RFIDCommandResult.code !== '9000') {
+                            await agent.Peripherals.Dispenser.deactivateRFID();
+
+                            const collectStatus = await agent.Peripherals.Dispenser.collectCardIntoCollectBin();
+                            if (collectStatus) {
+                                throw new Error('Reading trailer sector failed, the card is returned to the bin');
+                            } else {
+                                throw new Error('Reading trailer sector failed, the card cannot be returned to the bin');
+                            }
+                        }
+
+                        const accessBits = readTrailerResponse.Payload.slice(6, 10);
+                        const trailerPayload = [].concat(DEF_KEY).concat(accessBits).concat(createdKey.auth);
+
+                        console.log(`Modifying card with SN ${cardSerialNumber}, sector - ${dataSector}, new trailer - ${trailerPayload.join(',')}`);
+
+                        const writeTrailerResponse = await agent.Peripherals.Dispenser.writeSectorBlock({
+                            sectorNumber: dataSector,
+                            startBlock: 3,
+                            numberOfBlocks: 1,
+                            payload: trailerPayload
+                        });
+
+                        if (writeTrailerResponse.RFIDCommandResult.code !== '9000') {
                             await agent.Peripherals.Dispenser.deactivateRFID();
 
                             const collectStatus = await agent.Peripherals.Dispenser.collectCardIntoCollectBin();
